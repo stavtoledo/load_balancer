@@ -1,0 +1,13 @@
+build/
+cmake-cache/
+*.o
+*.obj
+*.so
+*.a
+*.pcap
+*.tr
+*.xml
+*.log
+*.pyc
+__pycache__/
+.vscode/
