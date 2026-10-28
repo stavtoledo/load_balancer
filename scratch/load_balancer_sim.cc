@@ -5,11 +5,12 @@
 #include "ns3/applications-module.h"
 #include "ns3/flow-monitor-module.h"
 #include <map>
+#include <vector>
 #include <limits>
 #include <iostream>
 #include <iomanip>
 #include <string>
-#include <fstream> // Added for CSV logging
+#include <fstream>
 
 using namespace ns3;
 
@@ -17,11 +18,13 @@ NS_LOG_COMPONENT_DEFINE("LoadBalancerSim");
 
 enum LoadBalancingStrategy {
     ROUND_ROBIN,
-    LEAST_CONNECTIONS
+    LEAST_CONNECTIONS,
+    IP_HASH,
+    WEIGHTED_ROUND_ROBIN
 };
 
 // ============================================================================
-// Phase 3, 4 & 5: Custom Load Balancer Application
+// Custom Load Balancer Application
 // ============================================================================
 class LoadBalancerApp : public Application {
 public:
@@ -33,7 +36,8 @@ public:
           m_sessionDuration(Seconds(1.5)),
           m_totalRequests(0),
           m_droppedRequests(0),
-          m_requestsThisInterval(0) {}
+          m_requestsThisInterval(0),
+          m_currentWeightCount(0) {}
 
     void Setup(uint16_t listenPort, 
                const std::vector<Ipv4Address> &serverIps, 
@@ -50,7 +54,17 @@ public:
             m_serverRequestCount[ip] = 0;
             m_serverBusyTime[ip] = Seconds(0);
             m_lastBusyStart[ip] = Seconds(0);
+            m_serverProcessingTime[ip] = m_sessionDuration; // Default processing time
+            m_weights[ip] = 1; // Default weight
         }
+    }
+
+    void SetServerProcessingTime(Ipv4Address serverIp, Time duration) {
+        m_serverProcessingTime[serverIp] = duration;
+    }
+
+    void SetServerWeight(Ipv4Address serverIp, uint32_t weight) {
+        m_weights[serverIp] = weight;
     }
 
     void SetServerHealth(Ipv4Address serverIp, bool isHealthy) {
@@ -98,7 +112,6 @@ public:
             uint32_t reqs = m_serverRequestCount[ip];
             double loadShare = (handledRequests > 0) ? (reqs / (double)handledRequests) * 100.0 : 0.0;
             
-            // Calculate final busy time to ensure active servers don't show 0%
             Time finalBusyTime = m_serverBusyTime[ip];
             if (m_activeConnections[ip] > 0 && m_serverHealth[ip]) {
                 finalBusyTime += (Simulator::Now() - m_lastBusyStart[ip]);
@@ -107,7 +120,6 @@ public:
             double util = (finalBusyTime.GetSeconds() / totalSimTime) * 100.0;
             if (util > 100.0) util = 100.0;
 
-            // FIX: Convert IP to string before passing to setw()
             std::ostringstream ipStr;
             ipStr << ip;
 
@@ -128,19 +140,14 @@ private:
 
         NS_LOG_INFO("[LoadBalancer] Listening on port " << m_port);
 
-        // Initialize CSV Logger for traffic plotting
         m_csv.open("traffic_pattern.csv");
         m_csv << "Time,Requests\n";
         Simulator::Schedule(Seconds(0.1), &LoadBalancerApp::LogTraffic, this);
     }
 
     virtual void StopApplication(void) override {
-        if (m_socket) {
-            m_socket->Close();
-        }
-        if (m_csv.is_open()) {
-            m_csv.close();
-        }
+        if (m_socket) m_socket->Close();
+        if (m_csv.is_open()) m_csv.close();
     }
 
     void LogTraffic() {
@@ -155,9 +162,9 @@ private:
 
         while ((packet = socket->RecvFrom(from))) {
             m_totalRequests++;
-            m_requestsThisInterval++; // Log for CSV
+            m_requestsThisInterval++; 
 
-            Ipv4Address targetServer = SelectBackendServer();
+            Ipv4Address targetServer = SelectBackendServer(from);
 
             if (targetServer == Ipv4Address("0.0.0.0")) {
                 m_droppedRequests++;
@@ -172,16 +179,17 @@ private:
 
             m_activeConnections[targetServer]++;
             ForwardPacket(packet, targetServer);
-            Simulator::Schedule(m_sessionDuration, &LoadBalancerApp::ReleaseConnection, this, targetServer);
+            
+            // Use heterogeneous processing time
+            Simulator::Schedule(m_serverProcessingTime[targetServer], &LoadBalancerApp::ReleaseConnection, this, targetServer);
         }
     }
 
-    Ipv4Address SelectBackendServer() {
-        if (m_strategy == LEAST_CONNECTIONS) {
-            return SelectLeastConnections();
-        } else {
-            return SelectRoundRobin();
-        }
+    Ipv4Address SelectBackendServer(Address from) {
+        if (m_strategy == LEAST_CONNECTIONS) return SelectLeastConnections();
+        if (m_strategy == IP_HASH) return SelectIpHash(from);
+        if (m_strategy == WEIGHTED_ROUND_ROBIN) return SelectWeightedRoundRobin();
+        return SelectRoundRobin();
     }
 
     Ipv4Address SelectRoundRobin() {
@@ -189,10 +197,7 @@ private:
         while (attempts < m_serverIps.size()) {
             Ipv4Address candidate = m_serverIps[m_nextServerIdx];
             m_nextServerIdx = (m_nextServerIdx + 1) % m_serverIps.size();
-
-            if (m_serverHealth[candidate]) {
-                return candidate;
-            }
+            if (m_serverHealth[candidate]) return candidate;
             attempts++;
         }
         return Ipv4Address("0.0.0.0");
@@ -204,14 +209,53 @@ private:
 
         for (const auto &ip : m_serverIps) {
             if (!m_serverHealth[ip]) continue;
-
-            uint32_t currentConns = m_activeConnections[ip];
-            if (currentConns < minConnections) {
-                minConnections = currentConns;
+            if (m_activeConnections[ip] < minConnections) {
+                minConnections = m_activeConnections[ip];
                 selectedServer = ip;
             }
         }
         return selectedServer;
+    }
+
+    Ipv4Address SelectIpHash(Address from) {
+        InetSocketAddress clientAddr = InetSocketAddress::ConvertFrom(from);
+        uint32_t ipAsInt = clientAddr.GetIpv4().Get();
+        
+        std::vector<Ipv4Address> healthyServers;
+        for (const auto &ip : m_serverIps) {
+            if (m_serverHealth[ip]) healthyServers.push_back(ip);
+        }
+        if (healthyServers.empty()) return Ipv4Address("0.0.0.0");
+
+        uint32_t targetIdx = ipAsInt % healthyServers.size();
+        return healthyServers[targetIdx];
+    }
+
+    Ipv4Address SelectWeightedRoundRobin() {
+        size_t attempts = 0;
+        uint32_t totalWeight = 0;
+        for (const auto &pair : m_weights) {
+            if(m_serverHealth[pair.first]) totalWeight += pair.second;
+        }
+        if (totalWeight == 0) return Ipv4Address("0.0.0.0");
+
+        while (attempts < totalWeight * m_serverIps.size()) {
+            Ipv4Address candidate = m_serverIps[m_nextServerIdx];
+            
+            if (m_serverHealth[candidate]) {
+                m_currentWeightCount++;
+                if (m_currentWeightCount >= m_weights[candidate]) {
+                    m_nextServerIdx = (m_nextServerIdx + 1) % m_serverIps.size();
+                    m_currentWeightCount = 0;
+                }
+                return candidate;
+            } else {
+                m_nextServerIdx = (m_nextServerIdx + 1) % m_serverIps.size();
+                m_currentWeightCount = 0;
+            }
+            attempts++;
+        }
+        return Ipv4Address("0.0.0.0");
     }
 
     void ReleaseConnection(Ipv4Address serverIp) {
@@ -237,18 +281,21 @@ private:
     std::vector<Ipv4Address> m_serverIps;
     size_t m_nextServerIdx;
     LoadBalancingStrategy m_strategy;
+    
     std::map<Ipv4Address, uint32_t> m_activeConnections;
     std::map<Ipv4Address, bool> m_serverHealth;
-    Time m_sessionDuration;
-
-    uint32_t m_totalRequests;
-    uint32_t m_droppedRequests;
     std::map<Ipv4Address, uint32_t> m_serverRequestCount;
     std::map<Ipv4Address, Time> m_serverBusyTime;
     std::map<Ipv4Address, Time> m_lastBusyStart;
+    
+    Time m_sessionDuration;
+    std::map<Ipv4Address, Time> m_serverProcessingTime;
+    std::map<Ipv4Address, uint32_t> m_weights;
 
-    // CSV Logger variables
+    uint32_t m_totalRequests;
+    uint32_t m_droppedRequests;
     uint32_t m_requestsThisInterval;
+    uint32_t m_currentWeightCount;
     std::ofstream m_csv;
 };
 
@@ -264,33 +311,23 @@ int main(int argc, char *argv[]) {
     uint16_t serverPort = 80;
     double simTime = 10.0;
 
-    // 1. Create Nodes
     NodeContainer clientNodes;
     clientNodes.Create(nClients);
-
     Ptr<Node> loadBalancerNode = CreateObject<Node>();
-
     NodeContainer serverNodes;
     serverNodes.Create(nServers);
 
-    // 2. Install Internet Stack
     InternetStackHelper stack;
     stack.Install(clientNodes);
     stack.Install(loadBalancerNode);
     stack.Install(serverNodes);
 
-    // 3. Point-to-Point Helper Configuration
     PointToPointHelper p2pClientLB;
     p2pClientLB.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
     p2pClientLB.SetChannelAttribute("Delay", StringValue("2ms"));
 
-    PointToPointHelper p2pLBServer;
-    p2pLBServer.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
-    p2pLBServer.SetChannelAttribute("Delay", StringValue("1ms"));
-
     Ipv4AddressHelper address;
 
-    // 4. Client Interfaces
     std::vector<Ipv4Address> lbClientSideIps;
     for (uint32_t i = 0; i < nClients; ++i) {
         NetDeviceContainer devices = p2pClientLB.Install(clientNodes.Get(i), loadBalancerNode);
@@ -301,9 +338,25 @@ int main(int argc, char *argv[]) {
         lbClientSideIps.push_back(ifaces.GetAddress(1));
     }
 
-    // 5. Server Interfaces
+    // ---------------------------------------------------------
+    // HETEROGENEOUS DATA CENTER CONFIGURATION
+    // ---------------------------------------------------------
     std::vector<Ipv4Address> backendServerIps;
     for (uint32_t i = 0; i < nServers; ++i) {
+        PointToPointHelper p2pLBServer;
+        
+        if (i == 0) {
+            // SERVER 1 (10.2.1.2) - Old Hardware: 2Mbps bottleneck, drops packets easily
+            p2pLBServer.SetDeviceAttribute("DataRate", StringValue("2Mbps"));
+            p2pLBServer.SetChannelAttribute("Delay", StringValue("10ms"));
+            p2pLBServer.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue("20p"));
+        } else {
+            // SERVERS 2 & 3 - Modern Hardware: 100Mbps, handles heavy burst queues
+            p2pLBServer.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
+            p2pLBServer.SetChannelAttribute("Delay", StringValue("1ms"));
+            p2pLBServer.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue("1000p"));
+        }
+
         NetDeviceContainer devices = p2pLBServer.Install(loadBalancerNode, serverNodes.Get(i));
         std::ostringstream subnet;
         subnet << "10.2." << (i + 1) << ".0";
@@ -316,73 +369,58 @@ int main(int argc, char *argv[]) {
         sinkApp.Start(Seconds(1.0));
         sinkApp.Stop(Seconds(simTime));
     }
-
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
-    // 6. Install Load Balancer App
+    // ---------------------------------------------------------
+    // LOAD BALANCER APPLICATION CONFIGURATION
+    // ---------------------------------------------------------
     Ptr<LoadBalancerApp> lbApp = CreateObject<LoadBalancerApp>();
-    lbApp->Setup(lbPort, backendServerIps, serverPort, LEAST_CONNECTIONS);
+    
+    // IMPORTANT: Change this parameter to test the different algorithms!
+    // Options: LEAST_CONNECTIONS, ROUND_ROBIN, IP_HASH, WEIGHTED_ROUND_ROBIN
+    lbApp->Setup(lbPort, backendServerIps, serverPort, WEIGHTED_ROUND_ROBIN); 
+    
     loadBalancerNode->AddApplication(lbApp);
     lbApp->SetStartTime(Seconds(1.0));
     lbApp->SetStopTime(Seconds(simTime));
 
-    // Simulate Server Failure at t = 4.0s (Server 1 / 10.2.2.2 fails)
+    // Configure Heterogeneous CPU Processing Times
+    lbApp->SetServerProcessingTime(backendServerIps[0], Seconds(5.0)); // Slow CPU
+    lbApp->SetServerProcessingTime(backendServerIps[1], Seconds(0.2)); // Fast CPU
+    lbApp->SetServerProcessingTime(backendServerIps[2], Seconds(0.2)); // Fast CPU
+
+    // Configure Server Weights (Only used if WEIGHTED_ROUND_ROBIN is active)
+    lbApp->SetServerWeight(backendServerIps[0], 1); 
+    lbApp->SetServerWeight(backendServerIps[1], 3); 
+    lbApp->SetServerWeight(backendServerIps[2], 3); 
+
+    // Simulate Server Failure at t = 4.0s (Server 2 / 10.2.2.2 fails)
     Simulator::Schedule(Seconds(4.0), &LoadBalancerApp::SetServerHealth, lbApp, backendServerIps[1], false);
 
-    // 7. Configurable Traffic Profile
-    std::string trafficProfile = "BURST"; 
-    NS_LOG_INFO("Configuring Client Traffic Generators with Profile: " << trafficProfile);
-
+    // ---------------------------------------------------------
+    // BURST TRAFFIC GENERATION
+    // ---------------------------------------------------------
     for (uint32_t i = 0; i < nClients; ++i) {
         Address lbTargetAddr(InetSocketAddress(lbClientSideIps[i], lbPort));
         OnOffHelper clientOnOff("ns3::UdpSocketFactory", lbTargetAddr);
 
-        if (trafficProfile == "STEADY") {
-            clientOnOff.SetAttribute("DataRate", StringValue("1.5Mbps"));
-            clientOnOff.SetAttribute("PacketSize", UintegerValue(512));
+        clientOnOff.SetAttribute("DataRate", StringValue("5Mbps"));
+        clientOnOff.SetAttribute("PacketSize", UintegerValue(1024));
 
-            Ptr<ExponentialRandomVariable> onVar = CreateObject<ExponentialRandomVariable>();
-            onVar->SetAttribute("Mean", DoubleValue(0.5));
-            clientOnOff.SetAttribute("OnTime", PointerValue(onVar));
+        Ptr<ParetoRandomVariable> onVar = CreateObject<ParetoRandomVariable>();
+        onVar->SetAttribute("Scale", DoubleValue(0.2)); 
+        onVar->SetAttribute("Shape", DoubleValue(1.5));
+        clientOnOff.SetAttribute("OnTime", PointerValue(onVar));
 
-            Ptr<ExponentialRandomVariable> offVar = CreateObject<ExponentialRandomVariable>();
-            offVar->SetAttribute("Mean", DoubleValue(0.5));
-            clientOnOff.SetAttribute("OffTime", PointerValue(offVar));
-
-        } else if (trafficProfile == "BURST") {
-            clientOnOff.SetAttribute("DataRate", StringValue("5Mbps"));
-            clientOnOff.SetAttribute("PacketSize", UintegerValue(1024));
-
-            Ptr<ParetoRandomVariable> onVar = CreateObject<ParetoRandomVariable>();
-            onVar->SetAttribute("Scale", DoubleValue(0.2)); 
-            onVar->SetAttribute("Shape", DoubleValue(1.5));
-            clientOnOff.SetAttribute("OnTime", PointerValue(onVar));
-
-            Ptr<ExponentialRandomVariable> offVar = CreateObject<ExponentialRandomVariable>();
-            offVar->SetAttribute("Mean", DoubleValue(0.8));
-            clientOnOff.SetAttribute("OffTime", PointerValue(offVar));
-
-        } else if (trafficProfile == "RANDOM") {
-            clientOnOff.SetAttribute("DataRate", StringValue("2Mbps"));
-            clientOnOff.SetAttribute("PacketSize", UintegerValue(768));
-
-            Ptr<UniformRandomVariable> onVar = CreateObject<UniformRandomVariable>();
-            onVar->SetAttribute("Min", DoubleValue(0.1));
-            onVar->SetAttribute("Max", DoubleValue(0.6));
-            clientOnOff.SetAttribute("OnTime", PointerValue(onVar));
-
-            Ptr<UniformRandomVariable> offVar = CreateObject<UniformRandomVariable>();
-            offVar->SetAttribute("Min", DoubleValue(0.2));
-            offVar->SetAttribute("Max", DoubleValue(0.9));
-            clientOnOff.SetAttribute("OffTime", PointerValue(offVar));
-        }
+        Ptr<ExponentialRandomVariable> offVar = CreateObject<ExponentialRandomVariable>();
+        offVar->SetAttribute("Mean", DoubleValue(0.8));
+        clientOnOff.SetAttribute("OffTime", PointerValue(offVar));
 
         ApplicationContainer clientApp = clientOnOff.Install(clientNodes.Get(i));
         clientApp.Start(Seconds(2.0 + i * 0.15));
         clientApp.Stop(Seconds(9.0));
     }
 
-    // 8. FlowMonitor Setup
     FlowMonitorHelper flowmon;
     Ptr<FlowMonitor> monitor = flowmon.InstallAll();
 
@@ -390,10 +428,8 @@ int main(int argc, char *argv[]) {
     Simulator::Stop(Seconds(simTime));
     Simulator::Run();
 
-    // Output Load Balancer Custom Metrics
     lbApp->PrintMetricsSummary(simTime);
 
-    // Output Network-Layer Flow Statistics
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmon.GetClassifier());
     std::map<FlowId, FlowMonitor::FlowStats> stats = monitor->GetFlowStats();
 
@@ -402,16 +438,23 @@ int main(int argc, char *argv[]) {
     for (auto const &item : stats) {
         Ipv4FlowClassifier::FiveTuple t = classifier->FindFlow(item.first);
         double rxPackets = item.second.rxPackets;
-        double meanDelayMs = (rxPackets > 0) ? (item.second.delaySum.GetSeconds() / rxPackets) * 1000.0 : 0.0;
-
-        std::cout << "Flow " << item.first << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
-        std::cout << "  Mean Latency / Response Delay: " << std::fixed << std::setprecision(3) << meanDelayMs << " ms\n";
+        
+        if (rxPackets > 0) {
+            double meanDelayMs = (item.second.delaySum.GetSeconds() / rxPackets) * 1000.0;
+            std::cout << "Flow " << item.first << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
+            std::cout << "  Mean Latency / Response Delay: " << std::fixed << std::setprecision(3) << meanDelayMs << " ms\n";
+        } else {
+            std::cout << "Flow " << item.first << " (" << t.sourceAddress << " -> " << t.destinationAddress << ")\n";
+            std::cout << "  Mean Latency: N/A (0 packets received)\n";
+        }
+        
+        if (item.second.lostPackets > 0) {
+            std::cout << "  *** WARNING: " << item.second.lostPackets << " dropped packets due to congestion! ***\n";
+        }
     }
     std::cout << "=====================================================================\n\n";
 
-    // Save trace XML file
     monitor->SerializeToXmlFile("load_balancer_flowmon.xml", true, true);
-
     Simulator::Destroy();
     return 0;
 }
