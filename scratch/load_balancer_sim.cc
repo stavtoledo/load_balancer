@@ -59,6 +59,16 @@ public:
         }
     }
 
+    std::string GetStrategyName() const {
+        switch (m_strategy) {
+            case ROUND_ROBIN: return "ROUND_ROBIN";
+            case LEAST_CONNECTIONS: return "LEAST_CONNECTIONS";
+            case IP_HASH: return "IP_HASH";
+            case WEIGHTED_ROUND_ROBIN: return "WEIGHTED_ROUND_ROBIN";
+            default: return "UNKNOWN";
+        }
+    }
+
     void SetServerProcessingTime(Ipv4Address serverIp, Time duration) {
         m_serverProcessingTime[serverIp] = duration;
     }
@@ -88,6 +98,7 @@ public:
     void PrintMetricsSummary(double totalSimTime) {
         std::cout << "\n=====================================================================\n";
         std::cout << "             PHASE 5: ADVANCED METRICS EVALUATION SUMMARY            \n";
+        std::cout << "             ALGORITHM: " << GetStrategyName() << "                  \n";
         std::cout << "=====================================================================\n\n";
 
         std::cout << "1. SYSTEM AVAILABILITY & FAULT TOLERANCE\n";
@@ -140,9 +151,13 @@ private:
 
         NS_LOG_INFO("[LoadBalancer] Listening on port " << m_port);
 
-        m_csv.open("traffic_pattern.csv");
-        m_csv << "Time,Requests\n";
-        Simulator::Schedule(Seconds(0.1), &LoadBalancerApp::LogTraffic, this);
+        // Name the CSV file dynamically based on the algorithm strategy
+        std::string filename = "time_series_" + GetStrategyName() + ".csv";
+        m_csv.open(filename.c_str());
+        m_csv << "Time_Seconds,Server_1_Requests,Server_2_Requests,Server_3_Requests\n";
+        
+        // Schedule the first logging event
+        Simulator::Schedule(Seconds(0.2), &LoadBalancerApp::LogTraffic, this);
     }
 
     virtual void StopApplication(void) override {
@@ -151,9 +166,15 @@ private:
     }
 
     void LogTraffic() {
-        m_csv << Simulator::Now().GetSeconds() << "," << m_requestsThisInterval << "\n";
-        m_requestsThisInterval = 0; 
-        Simulator::Schedule(Seconds(0.1), &LoadBalancerApp::LogTraffic, this);
+        if (m_csv.is_open() && m_serverIps.size() >= 3) {
+            double now = Simulator::Now().GetSeconds();
+            uint32_t s1_req = m_serverRequestCount[m_serverIps[0]];
+            uint32_t s2_req = m_serverRequestCount[m_serverIps[1]];
+            uint32_t s3_req = m_serverRequestCount[m_serverIps[2]];
+            
+            m_csv << now << "," << s1_req << "," << s2_req << "," << s3_req << "\n";
+        }
+        Simulator::Schedule(Seconds(0.2), &LoadBalancerApp::LogTraffic, this);
     }
 
     void HandleRead(Ptr<Socket> socket) {
