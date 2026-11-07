@@ -59,6 +59,10 @@ public:
         }
     }
 
+    void SetQueues(std::vector<Ptr<Queue<Packet>>> queues) {
+        m_queues = queues;
+    }
+
     std::string GetStrategyName() const {
         switch (m_strategy) {
             case ROUND_ROBIN: return "ROUND_ROBIN";
@@ -151,29 +155,41 @@ private:
 
         NS_LOG_INFO("[LoadBalancer] Listening on port " << m_port);
 
-        // Name the CSV file dynamically based on the algorithm strategy
         std::string filename = "time_series_" + GetStrategyName() + ".csv";
         m_csv.open(filename.c_str());
         m_csv << "Time_Seconds,Server_1_Requests,Server_2_Requests,Server_3_Requests\n";
+
+        std::string qFilename = "queue_series_" + GetStrategyName() + ".csv";
+        m_queueCsv.open(qFilename.c_str());
+        m_queueCsv << "Time_Seconds,Server_1_Queue,Server_2_Queue,Server_3_Queue\n";
         
-        // Schedule the first logging event
         Simulator::Schedule(Seconds(0.2), &LoadBalancerApp::LogTraffic, this);
     }
 
     virtual void StopApplication(void) override {
         if (m_socket) m_socket->Close();
         if (m_csv.is_open()) m_csv.close();
+        if (m_queueCsv.is_open()) m_queueCsv.close();
     }
 
     void LogTraffic() {
+        double now = Simulator::Now().GetSeconds();
+
         if (m_csv.is_open() && m_serverIps.size() >= 3) {
-            double now = Simulator::Now().GetSeconds();
             uint32_t s1_req = m_serverRequestCount[m_serverIps[0]];
             uint32_t s2_req = m_serverRequestCount[m_serverIps[1]];
             uint32_t s3_req = m_serverRequestCount[m_serverIps[2]];
             
             m_csv << now << "," << s1_req << "," << s2_req << "," << s3_req << "\n";
         }
+
+        if (m_queueCsv.is_open() && m_queues.size() >= 3) {
+            m_queueCsv << now << "," 
+                       << m_queues[0]->GetNPackets() << ","
+                       << m_queues[1]->GetNPackets() << ","
+                       << m_queues[2]->GetNPackets() << "\n";
+        }
+
         Simulator::Schedule(Seconds(0.2), &LoadBalancerApp::LogTraffic, this);
     }
 
@@ -201,7 +217,6 @@ private:
             m_activeConnections[targetServer]++;
             ForwardPacket(packet, targetServer);
             
-            // Use heterogeneous processing time
             Simulator::Schedule(m_serverProcessingTime[targetServer], &LoadBalancerApp::ReleaseConnection, this, targetServer);
         }
     }
@@ -318,6 +333,9 @@ private:
     uint32_t m_requestsThisInterval;
     uint32_t m_currentWeightCount;
     std::ofstream m_csv;
+    
+    std::ofstream m_queueCsv;
+    std::vector<Ptr<Queue<Packet>>> m_queues;
 };
 
 // ============================================================================
@@ -363,22 +381,26 @@ int main(int argc, char *argv[]) {
     // HETEROGENEOUS DATA CENTER CONFIGURATION
     // ---------------------------------------------------------
     std::vector<Ipv4Address> backendServerIps;
+    std::vector<Ptr<Queue<Packet>>> lbQueues; 
+
     for (uint32_t i = 0; i < nServers; ++i) {
         PointToPointHelper p2pLBServer;
         
         if (i == 0) {
-            // SERVER 1 (10.2.1.2) - Old Hardware: 2Mbps bottleneck, drops packets easily
             p2pLBServer.SetDeviceAttribute("DataRate", StringValue("2Mbps"));
             p2pLBServer.SetChannelAttribute("Delay", StringValue("10ms"));
             p2pLBServer.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue("20p"));
         } else {
-            // SERVERS 2 & 3 - Modern Hardware: 100Mbps, handles heavy burst queues
             p2pLBServer.SetDeviceAttribute("DataRate", StringValue("100Mbps"));
             p2pLBServer.SetChannelAttribute("Delay", StringValue("1ms"));
             p2pLBServer.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue("1000p"));
         }
 
         NetDeviceContainer devices = p2pLBServer.Install(loadBalancerNode, serverNodes.Get(i));
+        
+        Ptr<PointToPointNetDevice> ptpDevice = DynamicCast<PointToPointNetDevice>(devices.Get(0));
+        lbQueues.push_back(ptpDevice->GetQueue());
+
         std::ostringstream subnet;
         subnet << "10.2." << (i + 1) << ".0";
         address.SetBase(subnet.str().c_str(), "255.255.255.0");
@@ -400,22 +422,20 @@ int main(int argc, char *argv[]) {
     // IMPORTANT: Change this parameter to test the different algorithms!
     // Options: LEAST_CONNECTIONS, ROUND_ROBIN, IP_HASH, WEIGHTED_ROUND_ROBIN
     lbApp->Setup(lbPort, backendServerIps, serverPort, WEIGHTED_ROUND_ROBIN); 
+    lbApp->SetQueues(lbQueues);
     
     loadBalancerNode->AddApplication(lbApp);
     lbApp->SetStartTime(Seconds(1.0));
     lbApp->SetStopTime(Seconds(simTime));
 
-    // Configure Heterogeneous CPU Processing Times
-    lbApp->SetServerProcessingTime(backendServerIps[0], Seconds(5.0)); // Slow CPU
-    lbApp->SetServerProcessingTime(backendServerIps[1], Seconds(0.2)); // Fast CPU
-    lbApp->SetServerProcessingTime(backendServerIps[2], Seconds(0.2)); // Fast CPU
+    lbApp->SetServerProcessingTime(backendServerIps[0], Seconds(5.0)); 
+    lbApp->SetServerProcessingTime(backendServerIps[1], Seconds(0.2)); 
+    lbApp->SetServerProcessingTime(backendServerIps[2], Seconds(0.2)); 
 
-    // Configure Server Weights (Only used if WEIGHTED_ROUND_ROBIN is active)
     lbApp->SetServerWeight(backendServerIps[0], 1); 
     lbApp->SetServerWeight(backendServerIps[1], 3); 
     lbApp->SetServerWeight(backendServerIps[2], 3); 
 
-    // Simulate Server Failure at t = 4.0s (Server 2 / 10.2.2.2 fails)
     Simulator::Schedule(Seconds(4.0), &LoadBalancerApp::SetServerHealth, lbApp, backendServerIps[1], false);
 
     // ---------------------------------------------------------
