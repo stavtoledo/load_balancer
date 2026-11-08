@@ -34,6 +34,8 @@ public:
           m_nextServerIdx(0), 
           m_strategy(LEAST_CONNECTIONS),
           m_sessionDuration(Seconds(1.5)),
+          m_pingInterval(Seconds(0.5)),
+          m_pingTimeout(Seconds(1.5)),
           m_totalRequests(0),
           m_droppedRequests(0),
           m_requestsThisInterval(0),
@@ -79,24 +81,6 @@ public:
 
     void SetServerWeight(Ipv4Address serverIp, uint32_t weight) {
         m_weights[serverIp] = weight;
-    }
-
-    void SetServerHealth(Ipv4Address serverIp, bool isHealthy) {
-        m_serverHealth[serverIp] = isHealthy;
-        if (!isHealthy) {
-            NS_LOG_INFO("[HealthCheck] *** SERVER FAILURE DETECTED *** Server " << serverIp << " is DOWN!");
-            std::cout << "\n========================================\n"
-                      << "[HealthCheck] SERVER " << serverIp << " IS NOW DOWN! (t = " 
-                      << Simulator::Now().GetSeconds() << "s)\n"
-                      << "========================================\n" << std::endl;
-            
-            if (m_activeConnections[serverIp] > 0) {
-                m_serverBusyTime[serverIp] += (Simulator::Now() - m_lastBusyStart[serverIp]);
-            }
-            m_activeConnections[serverIp] = 0;
-        } else {
-            NS_LOG_INFO("[HealthCheck] Server " << serverIp << " recovered and is UP!");
-        }
     }
 
     void PrintMetricsSummary(double totalSimTime) {
@@ -148,12 +132,23 @@ public:
 
 private:
     virtual void StartApplication(void) override {
+        // Main load balancer socket setup
         m_socket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
         InetSocketAddress local = InetSocketAddress(Ipv4Address::GetAny(), m_port);
         m_socket->Bind(local);
         m_socket->SetRecvCallback(MakeCallback(&LoadBalancerApp::HandleRead, this));
 
         NS_LOG_INFO("[LoadBalancer] Listening on port " << m_port);
+
+        // Active Heartbeat Socket Setup
+        m_pingSocket = Socket::CreateSocket(GetNode(), UdpSocketFactory::GetTypeId());
+        m_pingSocket->Bind(); 
+        m_pingSocket->SetRecvCallback(MakeCallback(&LoadBalancerApp::HandlePingRead, this));
+
+        // Initialize heartbeat timers
+        for (const auto &ip : m_serverIps) {
+            m_lastHeartbeat[ip] = Simulator::Now();
+        }
 
         std::string filename = "time_series_" + GetStrategyName() + ".csv";
         m_csv.open(filename.c_str());
@@ -164,12 +159,64 @@ private:
         m_queueCsv << "Time_Seconds,Server_1_Queue,Server_2_Queue,Server_3_Queue\n";
         
         Simulator::Schedule(Seconds(0.2), &LoadBalancerApp::LogTraffic, this);
+        Simulator::Schedule(Seconds(1.0), &LoadBalancerApp::SendHeartbeats, this);
+        Simulator::Schedule(Seconds(1.1), &LoadBalancerApp::CheckServerTimeouts, this);
     }
 
     virtual void StopApplication(void) override {
         if (m_socket) m_socket->Close();
+        if (m_pingSocket) m_pingSocket->Close();
         if (m_csv.is_open()) m_csv.close();
         if (m_queueCsv.is_open()) m_queueCsv.close();
+    }
+
+    void SendHeartbeats() {
+        for (const auto &ip : m_serverIps) {
+            // Ping everyone, dead or alive, to allow for recovery
+            Ptr<Packet> ping = Create<Packet>(16); 
+            m_pingSocket->SendTo(ping, 0, InetSocketAddress(ip, 9)); // Port 9 for Echo
+        }
+        Simulator::Schedule(m_pingInterval, &LoadBalancerApp::SendHeartbeats, this);
+    }
+
+    void HandlePingRead(Ptr<Socket> socket) {
+        Ptr<Packet> packet;
+        Address from;
+        while ((packet = socket->RecvFrom(from))) {
+            InetSocketAddress address = InetSocketAddress::ConvertFrom(from);
+            Ipv4Address senderIp = address.GetIpv4();
+            m_lastHeartbeat[senderIp] = Simulator::Now();
+
+            // If a "DOWN" server replies to a ping, it has recovered!
+            if (!m_serverHealth[senderIp]) {
+                m_serverHealth[senderIp] = true; 
+                std::cout << "\n========================================\n"
+                          << "[HealthCheck] SERVER " << senderIp << " RECOVERED! (t = " 
+                          << Simulator::Now().GetSeconds() << "s)\n"
+                          << "========================================\n" << std::endl;
+            }
+        }
+    }
+
+    void CheckServerTimeouts() {
+        Time now = Simulator::Now();
+        for (const auto &ip : m_serverIps) {
+            if (m_serverHealth[ip] && (now - m_lastHeartbeat[ip] > m_pingTimeout)) {
+                m_serverHealth[ip] = false; // Mark server as down
+                
+                std::cout << "\n========================================\n"
+                          << "[HealthCheck] SERVER " << ip << " TIMEOUT! MARKED DOWN! (t = " 
+                          << now.GetSeconds() << "s)\n"
+                          << "Blind Spot Duration: " << (now.GetSeconds() - 4.0) << " seconds.\n"
+                          << "========================================\n" << std::endl;
+                
+                if (m_activeConnections[ip] > 0) {
+                    m_serverBusyTime[ip] += (now - m_lastBusyStart[ip]);
+                }
+                m_activeConnections[ip] = 0;
+            }
+        }
+        Simulator::Schedule(Seconds(0.1), &LoadBalancerApp::CheckServerTimeouts, this);
     }
 
     void LogTraffic() {
@@ -205,8 +252,7 @@ private:
 
             if (targetServer == Ipv4Address("0.0.0.0")) {
                 m_droppedRequests++;
-                NS_LOG_ERROR("[LoadBalancer] All backend servers DOWN! Request dropped.");
-                continue;
+                continue; // Drop the request internally since no backend is available
             }
 
             m_serverRequestCount[targetServer]++;
@@ -314,6 +360,8 @@ private:
     uint16_t m_port;
     uint16_t m_serverPort;
     Ptr<Socket> m_socket;
+    Ptr<Socket> m_pingSocket;
+    
     std::vector<Ipv4Address> m_serverIps;
     size_t m_nextServerIdx;
     LoadBalancingStrategy m_strategy;
@@ -324,7 +372,12 @@ private:
     std::map<Ipv4Address, Time> m_serverBusyTime;
     std::map<Ipv4Address, Time> m_lastBusyStart;
     
+    std::map<Ipv4Address, Time> m_lastHeartbeat;
+    
     Time m_sessionDuration;
+    Time m_pingInterval;
+    Time m_pingTimeout;
+    
     std::map<Ipv4Address, Time> m_serverProcessingTime;
     std::map<Ipv4Address, uint32_t> m_weights;
 
@@ -348,7 +401,7 @@ int main(int argc, char *argv[]) {
     uint32_t nServers = 3;
     uint16_t lbPort = 8080;
     uint16_t serverPort = 80;
-    double simTime = 10.0;
+    double simTime = 15.0;
 
     NodeContainer clientNodes;
     clientNodes.Create(nClients);
@@ -383,6 +436,8 @@ int main(int argc, char *argv[]) {
     std::vector<Ipv4Address> backendServerIps;
     std::vector<Ptr<Queue<Packet>>> lbQueues; 
 
+    UdpEchoServerHelper echoServer(9); // Port 9 for ICMP/Echo
+
     for (uint32_t i = 0; i < nServers; ++i) {
         PointToPointHelper p2pLBServer;
         
@@ -410,7 +465,18 @@ int main(int argc, char *argv[]) {
         PacketSinkHelper sinkHelper("ns3::UdpSocketFactory", InetSocketAddress(Ipv4Address::GetAny(), serverPort));
         ApplicationContainer sinkApp = sinkHelper.Install(serverNodes.Get(i));
         sinkApp.Start(Seconds(1.0));
-        sinkApp.Stop(Seconds(simTime));
+
+        ApplicationContainer echoApp = echoServer.Install(serverNodes.Get(i));
+        echoApp.Start(Seconds(1.0));
+
+        // Realistically crash Server 2 at exactly t=4.0s by shutting off its applications
+        if (i == 1) {
+            sinkApp.Stop(Seconds(4.0));
+            echoApp.Stop(Seconds(4.0)); 
+        } else {
+            sinkApp.Stop(Seconds(simTime));
+            echoApp.Stop(Seconds(simTime));
+        }
     }
     Ipv4GlobalRoutingHelper::PopulateRoutingTables();
 
@@ -436,8 +502,6 @@ int main(int argc, char *argv[]) {
     lbApp->SetServerWeight(backendServerIps[1], 3); 
     lbApp->SetServerWeight(backendServerIps[2], 3); 
 
-    Simulator::Schedule(Seconds(4.0), &LoadBalancerApp::SetServerHealth, lbApp, backendServerIps[1], false);
-
     // ---------------------------------------------------------
     // BURST TRAFFIC GENERATION
     // ---------------------------------------------------------
@@ -459,7 +523,7 @@ int main(int argc, char *argv[]) {
 
         ApplicationContainer clientApp = clientOnOff.Install(clientNodes.Get(i));
         clientApp.Start(Seconds(2.0 + i * 0.15));
-        clientApp.Stop(Seconds(9.0));
+        clientApp.Stop(Seconds(14.0)); // Clients stop at 14s, giving 1 second for queues to drain
     }
 
     FlowMonitorHelper flowmon;
